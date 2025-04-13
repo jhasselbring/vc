@@ -77,3 +77,4 @@ if (!checkCommand('ffmpeg') || !checkCommand('ffprobe')) {
     process.exit(1);
   }
 })();
+ 

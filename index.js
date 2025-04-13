@@ -4,20 +4,46 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import chalk from 'chalk';
-import minimist from 'minimist'; // Import minimist
-import { findFilesToProcess } from './src/directoryProcessor.js'; // We'll create/modify this
-import { runParallelProcessing } from './src/parallelProcessor.js'; // We'll create this
+import minimist from 'minimist';
+import { findFilesToProcess } from './src/directoryProcessor.js';
+import { runParallelProcessing } from './src/parallelProcessor.js';
 
 // --- Argument Parsing ---
 const argv = minimist(process.argv.slice(2), {
-  alias: { p: 'parallel' }, // Alias -p to --parallel
-  default: { parallel: 1 }, // Default parallel to 1
+  alias: {
+    p: 'parallel',
+    t: 'target', // Alias -t to --target
+    h: 'help',   // Add a help flag
+  },
+  default: {
+    parallel: 1,
+    // No default for target, let it default to '.' if not provided
+  },
+  boolean: ['help', 'dry-run'], // Specify boolean flags
 });
 
-const dryRun = argv['dry-run'] || false;
+// --- Help ---
+if (argv.help) {
+  console.log(`
+Usage: ffmpeg-helper [options] [optional_target_directory]
+
+Options:
+  -t, --target <dir>    Directory to process (defaults to current directory if not specified)
+  -p, --parallel <num>  Number of files to process in parallel (default: 1)
+  --dry-run             List actions without converting or deleting files
+  -h, --help            Show this help message
+`);
+  process.exit(0);
+}
+
+
+const dryRun = argv['dry-run'];
 const parallelCount = parseInt(argv.parallel, 10);
-const targetDirArg = argv._[0]; // First non-option argument
-const targetDirectory = path.resolve(targetDirArg || '.');
+
+// Determine target directory: Use --target first, then positional argument, then default to '.'
+let targetDirInput = argv.target || argv._[0] || '.';
+const targetDirectory = path.resolve(targetDirInput);
+
 
 if (isNaN(parallelCount) || parallelCount < 1) {
     console.error(chalk.red('Error: --parallel (-p) value must be a positive integer.'));
@@ -40,6 +66,7 @@ if (!fs.statSync(targetDirectory).isDirectory()) {
     console.error(chalk.red(`Error: Provided path is not a directory - ${targetDirectory}`));
     process.exit(1);
 }
+
 
 // --- FFmpeg/FFprobe Check ---
 function checkCommand(command) {
@@ -68,7 +95,7 @@ if (!checkCommand('ffmpeg') || !checkCommand('ffprobe')) {
 (async () => {
   try {
     console.log(chalk.blue(`Scanning directory: ${targetDirectory}...`));
-    const filesToProcess = findFilesToProcess(targetDirectory); // Get all files first
+    const filesToProcess = findFilesToProcess(targetDirectory);
     const totalFiles = filesToProcess.length;
     console.log(chalk.blue(`Found ${totalFiles} file(s) potentially needing conversion.`));
 
@@ -77,14 +104,13 @@ if (!checkCommand('ffmpeg') || !checkCommand('ffprobe')) {
         process.exit(0);
     }
 
-    // Call the parallel processing function
     await runParallelProcessing(filesToProcess, parallelCount, dryRun, targetDirectory);
 
-    process.stdout.write('\n'); // Newline after progress indicator finishes
+    process.stdout.write('\n');
     console.log(chalk.green('Conversion process finished.'));
 
   } catch (error) {
-    process.stdout.write('\n'); // Ensure errors start on a new line
+    process.stdout.write('\n');
     console.error(chalk.red("An unexpected error occurred during processing:"), error);
     process.exit(1);
   }

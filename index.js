@@ -104,13 +104,16 @@ if (!checkCommand('ffmpeg') || !checkCommand('ffprobe')) {
         process.exit(0);
     }
 
+    console.clear();
+    console.log(chalk.blue(`Starting conversion process for ${totalFiles} file(s)...`));
+
     await runParallelProcessing(filesToProcess, parallelCount, dryRun, targetDirectory);
 
     process.stdout.write('\n');
     console.log(chalk.green('Conversion process finished.'));
 
   } catch (error) {
-    process.stdout.write('\n');
+    console.clear();
     console.error(chalk.red("An unexpected error occurred during processing:"), error);
     process.exit(1);
   }

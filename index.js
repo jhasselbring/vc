@@ -95,7 +95,7 @@ if (!checkCommand('ffmpeg') || !checkCommand('ffprobe')) {
 (async () => {
   try {
     console.log(chalk.blue(`Scanning directory: ${targetDirectory}...`));
-    const filesToProcess = findFilesToProcess(targetDirectory);
+    const filesToProcess = await findFilesToProcess(targetDirectory);
     const totalFiles = filesToProcess.length;
     console.log(chalk.blue(`Found ${totalFiles} file(s) potentially needing conversion.`));
 

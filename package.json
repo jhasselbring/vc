@@ -6,7 +6,6 @@
   "bin": {
     "vc": "./index.js"
   },
-
   "scripts": {
     "publish": "npm publish --access public",
     "patch": "git add . && git commit -m patch-update && git push && npm version patch && npm publish --access public",
@@ -16,5 +15,8 @@
   "keywords": [],
   "author": "",
   "license": "ISC",
-  "description": ""
+  "description": "",
+  "dependencies": {
+    "chalk": "^5.4.1"
+  }
 }

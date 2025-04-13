@@ -1,23 +1,23 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { spawnSync } from 'node:child_process';
+import chalk from 'chalk';
 
 export async function getMediaInfo(filePath) {
-  console.log(`Probing: ${filePath}`);
   const ffprobeArgs = [
     '-v', 'quiet',
     '-print_format', 'json',
     '-show_streams',
-    '-select_streams', 'v:0', // Select only the first video stream
+    '-select_streams', 'v:0',
     filePath,
   ];
 
   try {
-    // Use async spawn when possible, but for simplicity keeping sync
     const result = spawnSync('ffprobe', ffprobeArgs, { encoding: 'utf8' });
 
     if (result.status !== 0 || result.error) {
-      console.error(`ffprobe failed for ${filePath}: Status ${result.status}`);
+      process.stdout.write('\n');
+      console.error(chalk.red(`ffprobe failed for ${path.basename(filePath)}: Status ${result.status}`));
       if (result.stderr) console.error('ffprobe stderr:', result.stderr);
       if (result.error) console.error('ffprobe spawn error:', result.error);
       return null;
@@ -27,7 +27,8 @@ export async function getMediaInfo(filePath) {
     const stream = output.streams && output.streams[0];
 
     if (!stream) {
-      console.warn(`No video stream found in ${filePath}`);
+      process.stdout.write('\n');
+      console.warn(chalk.yellow(`No video stream found in ${path.basename(filePath)}`));
       return null;
     }
 
@@ -36,14 +37,16 @@ export async function getMediaInfo(filePath) {
     const bitRate = stream.bit_rate ? parseInt(stream.bit_rate, 10) : NaN;
 
     if (isNaN(width) || isNaN(height)) {
-       console.warn(`Could not parse width/height for ${filePath}`);
-       return null;
+      process.stdout.write('\n');
+      console.warn(chalk.yellow(`Could not parse width/height for ${path.basename(filePath)}`));
+      return null;
     }
 
     return { width, height, bitRate };
 
   } catch (error) {
-    console.error(`Error running or parsing ffprobe for ${filePath}:`, error.message);
+    process.stdout.write('\n');
+    console.error(chalk.red(`Error running ffprobe for ${path.basename(filePath)}:`), error.message);
     if (error.stderr) {
         console.error('ffprobe stderr:', error.stderr.toString());
     }
@@ -51,16 +54,30 @@ export async function getMediaInfo(filePath) {
   }
 }
 
-export function convertToWebm(filePath, dryRun, crf) {
+function moveFailedFile(filePath, rootDir) {
+    try {
+        const parentDir = path.dirname(rootDir);
+        const targetDirName = path.basename(rootDir);
+        const relativeFilePath = path.relative(rootDir, filePath);
+        const failedDirPath = path.join(parentDir, `@failed_vc_${targetDirName}`, path.dirname(relativeFilePath));
+        const failedFilePath = path.join(failedDirPath, path.basename(relativeFilePath));
+
+        fs.mkdirSync(failedDirPath, { recursive: true });
+        fs.renameSync(filePath, failedFilePath);
+        process.stdout.write('\n');
+        console.log(chalk.yellow(`Moved failed file to: ${failedFilePath}`));
+    } catch (moveError) {
+        process.stdout.write('\n');
+        console.error(chalk.red(`Failed to move file ${filePath} after conversion error:`), moveError.message);
+    }
+}
+
+export function convertToWebm(filePath, dryRun, crf, rootDir) {
   const parsedPath = path.parse(filePath);
   const outputFilePath = path.join(parsedPath.dir, `${parsedPath.name}.webm`);
 
-  console.log(`Attempting conversion: ${filePath} -> ${outputFilePath} (CRF: ${crf})`);
-
   if (dryRun) {
-    console.log(`[DRY RUN] Would convert: ${filePath} with CRF ${crf}`);
-    console.log(`[DRY RUN] Would delete: ${filePath} on success`);
-    return;
+    return 'skipped_dry_run';
   }
 
   const ffmpegArgs = [
@@ -69,29 +86,30 @@ export function convertToWebm(filePath, dryRun, crf) {
     '-crf', crf.toString(),
     '-b:v', '0',
     '-c:a', 'libopus',
-    '-cpu-used', '0', // Consider making this configurable or adaptive
+    '-cpu-used', '0',
+    '-y',
     outputFilePath,
   ];
 
   try {
     if (fs.existsSync(outputFilePath)) {
-        console.log(`Skipping: Output file already exists - ${outputFilePath}`);
-        return;
+        return 'skipped_exists';
     }
 
-    console.log(`Running: ffmpeg ${ffmpegArgs.join(' ')}`);
     const result = spawnSync('ffmpeg', ffmpegArgs, { stdio: 'pipe' });
 
     if (result.status === 0) {
-      console.log(`Successfully converted: ${filePath} → ${outputFilePath}`);
       try {
         fs.unlinkSync(filePath);
-        console.log(`Deleted original file: ${filePath}`);
+        return 'converted';
       } catch (deleteError) {
-        console.error(`Error deleting original file ${filePath}:`, deleteError.message);
+        process.stdout.write('\n');
+        console.error(chalk.red(`Successfully converted, but failed to delete original file ${path.basename(filePath)}:`), deleteError.message);
+        return 'error_deleting';
       }
     } else {
-      console.error(`FFmpeg conversion failed for ${filePath}:`);
+      process.stdout.write('\n');
+      console.error(chalk.red(`FFmpeg conversion failed for ${path.basename(filePath)}:`));
       console.error(`Status: ${result.status}`);
       if (result.stderr) {
         console.error('FFmpeg stderr:', result.stderr.toString());
@@ -99,17 +117,20 @@ export function convertToWebm(filePath, dryRun, crf) {
        if (result.error) {
            console.error('Spawn error:', result.error);
        }
-      // Clean up incomplete output file
       if (fs.existsSync(outputFilePath)) {
           try {
               fs.unlinkSync(outputFilePath);
-              console.log(`Deleted incomplete output file: ${outputFilePath}`);
           } catch (cleanupError) {
-              console.error(`Error deleting incomplete output file ${outputFilePath}:`, cleanupError.message);
+              console.error(chalk.yellow(`Error deleting incomplete output file ${path.basename(outputFilePath)}:`), cleanupError.message);
           }
       }
+      moveFailedFile(filePath, rootDir);
+      return 'error_converting';
     }
   } catch (spawnError) {
-    console.error(`Error spawning FFmpeg for ${filePath}:`, spawnError.message);
+    process.stdout.write('\n');
+    console.error(chalk.red(`Error spawning FFmpeg for ${path.basename(filePath)}:`), spawnError.message);
+    moveFailedFile(filePath, rootDir);
+    return 'error_spawning';
   }
 } 

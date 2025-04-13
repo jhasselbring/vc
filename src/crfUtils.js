@@ -2,6 +2,8 @@ export const DEFAULT_CRF = 24; // Default CRF if media info cannot be obtained
 
 export function determineCrf(mediaInfo) {
     if (!mediaInfo) {
+        // Keep this warning as it's useful
+        // Maybe add a newline before it if other errors are common?
         console.warn(`Using default CRF ${DEFAULT_CRF} due to missing media info.`);
         return DEFAULT_CRF;
     }
@@ -19,6 +21,6 @@ export function determineCrf(mediaInfo) {
     } else { // Lower quality source
         crf = 20; // Lower CRF to preserve more detail
     }
-    console.log(`Determined CRF: ${crf} (Resolution: ${width}x${height}, Bitrate: ${bitRateMbps > 0 ? bitRateMbps.toFixed(2) + ' Mbps' : 'N/A'})`);
+    // console.log(`Determined CRF: ${crf} (Resolution: ${width}x${height}, Bitrate: ${bitRateMbps > 0 ? bitRateMbps.toFixed(2) + ' Mbps' : 'N/A'})`); // Removed log
     return crf;
 } 

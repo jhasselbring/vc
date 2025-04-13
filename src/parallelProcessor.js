@@ -8,7 +8,8 @@ class ProgressManager {
     constructor(totalFiles, rootDir) {
         this.totalFiles = totalFiles;
         this.processedCount = 0;
-        this.rootDirName = path.basename(rootDir);
+        this.rootDir = path.resolve(rootDir);
+        this.rootDirName = path.basename(this.rootDir);
         this.lastMessageLength = 0; // To clear previous line
     }
 
@@ -16,7 +17,7 @@ class ProgressManager {
     update(filePath, status) {
         this.processedCount++;
         const percentage = this.totalFiles > 0 ? Math.round((this.processedCount / this.totalFiles) * 100) : 0;
-        const relativePath = path.relative(path.dirname(this.rootDirName), filePath); // Adjust relative path calculation if needed
+        const relativePath = path.relative(this.rootDir, filePath);
 
         const statusIndicator = status === 'converted' ? chalk.green('✓') :
                                 status === 'skipped_exists' ? chalk.blue('-') :
@@ -30,10 +31,9 @@ class ProgressManager {
         process.stdout.write(message);
         this.lastMessageLength = message.replace(/\x1B\[[0-9;]*m/g, '').length; // Store length without ANSI codes
 
-        // If it was an error, print a newline *after* updating the progress bar
-        // so the error message appears below but the progress bar remains correct.
-        if (status.startsWith('error_')) {
-           process.stdout.write('\n');
+        if (status.startsWith('error_') || status === 'error_deleting') {
+           // Don't write newline here, let the error logging handle it if necessary
+           // This prevents double newlines if error logs already added one.
         }
     }
 }
@@ -42,74 +42,78 @@ class ProgressManager {
 async function processFile(filePath, dryRun, rootDir, progressManager) {
     let status = 'error_unknown';
     try {
-        const mediaInfo = await getMediaInfo(filePath); // Can return null
-        const crf = determineCrf(mediaInfo); // Handles null mediaInfo
-        status = convertToWebm(filePath, dryRun, crf, rootDir); // Returns status string
+        const mediaInfo = await getMediaInfo(filePath);
+        const crf = determineCrf(mediaInfo);
+        status = await convertToWebm(filePath, dryRun, crf, rootDir);
     } catch (error) {
-        // Catch unexpected errors during the processFile flow itself
-        process.stdout.write('\n');
-        console.error(chalk.red(`Unexpected error processing file ${path.basename(filePath)}:`), error);
-        status = 'error_unexpected';
-        // Potentially move the file here too if it wasn't moved by convertToWebm
-        // moveFailedFile(filePath, rootDir); // Consider adding this call here if needed
+        // This catch block handles unexpected errors *within* the processFile logic itself,
+        // not errors from ffmpeg/ffprobe which are handled inside those utils now.
+        process.stdout.write('\n'); // Ensure newline before this specific error
+        console.error(chalk.red(`Unexpected error during file processing task for ${path.basename(filePath)}:`), error);
+        status = 'error_task_internal'; // Assign a specific status
+        // Consider moving the file even for these errors? Depends on the cause.
+        // moveFailedFile(filePath, rootDir); // Maybe
     } finally {
-        // Ensure progress is updated even if unexpected errors occur
+        // Crucial: Update progress regardless of how the try block exited.
         progressManager.update(filePath, status);
     }
 }
 
 export async function runParallelProcessing(files, parallelCount, dryRun, rootDir) {
     const progressManager = new ProgressManager(files.length, rootDir);
-    const queue = [...files]; // Copy the array to treat as a queue
+    const queue = [...files];
     const activeTasks = [];
+    let processingComplete = false; // Flag to signal completion
 
-    const runNext = async () => {
+    const runNext = () => {
+        // Check if processing is already marked as complete
+        if (processingComplete) return;
+
         while (activeTasks.length < parallelCount && queue.length > 0) {
-            const filePath = queue.shift(); // Get the next file
+            const filePath = queue.shift();
             if (filePath) {
-                // Create the promise, push it to activeTasks, and add error handling
-                 const taskPromise = processFile(filePath, dryRun, rootDir, progressManager)
-                     .catch(err => {
-                         // This catch is mainly for programmer errors in processFile,
-                         // as operational errors should be handled inside processFile.
+                const taskPromise = processFile(filePath, dryRun, rootDir, progressManager)
+                    .catch(err => {
+                         // Catch should ideally not happen if processFile handles its errors
                          process.stdout.write('\n');
-                         console.error(chalk.magenta(`Internal error during task for ${path.basename(filePath)}:`), err);
-                         // Update progress even for these errors if not already done
-                         if (!progressManager.processedCount < progressManager.totalFiles) { // Avoid double count if finally block ran
-                             progressManager.update(filePath, 'error_internal');
-                         }
-                     })
-                     .finally(() => {
-                         // Remove the completed task from the active list
+                         console.error(chalk.magenta(`Internal error caught in task runner for ${path.basename(filePath)}:`), err);
+                         // Ensure progress reflects an error state if it wasn't already updated
+                         progressManager.update(filePath, 'error_runner_internal');
+                    })
+                    .finally(() => {
                          const index = activeTasks.indexOf(taskPromise);
                          if (index > -1) {
                              activeTasks.splice(index, 1);
                          }
-                         // Immediately try to run the next task if slots are available
-                         runNext();
-                     });
-                 activeTasks.push(taskPromise);
+                         // Check if we are done after this task finishes
+                         if (queue.length === 0 && activeTasks.length === 0) {
+                             processingComplete = true;
+                         } else {
+                            // Otherwise, try to run the next task immediately
+                            runNext();
+                         }
+                    });
+                activeTasks.push(taskPromise);
             }
         }
-
-        // If the queue is empty and all active tasks are finished, we are done.
+         // If the queue is empty and all active tasks are finished, signal completion
         if (queue.length === 0 && activeTasks.length === 0) {
-             // All tasks initiated and completed
-             return Promise.resolve(); // Signal completion
+            processingComplete = true;
         }
     };
 
-    // Start the initial batch of tasks
+    // Start initial tasks
     runNext();
 
-    // Need a way to wait until everything is truly finished.
-    // We can poll or use a master promise. Let's use polling for simplicity here.
+    // Use a promise-based wait instead of polling
     return new Promise(resolve => {
-        const checkCompletion = setInterval(() => {
-            if (queue.length === 0 && activeTasks.length === 0) {
-                clearInterval(checkCompletion);
+        const checkCompletion = () => {
+            if (processingComplete) {
                 resolve();
+            } else {
+                setTimeout(checkCompletion, 100); // Check again shortly
             }
-        }, 100); // Check every 100ms
+        };
+        checkCompletion(); // Start the check loop
     });
 } 

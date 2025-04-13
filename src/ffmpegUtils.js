@@ -1,9 +1,41 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import chalk from 'chalk';
 
+// Helper to run a command asynchronously and capture output/errors
+function runCommandAsync(command, args, filePath, ignoreStdErr = false) {
+    return new Promise((resolve, reject) => {
+        const process = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'] }); // stdin, stdout, stderr
+        let stdout = '';
+        let stderr = '';
+
+        process.stdout.on('data', (data) => {
+            stdout += data.toString();
+        });
+
+        process.stderr.on('data', (data) => {
+            stderr += data.toString();
+        });
+
+        process.on('error', (error) => {
+            // Errors when spawning the process itself
+            reject({ type: 'spawn_error', message: error.message, filePath });
+        });
+
+        process.on('close', (code) => {
+            if (code === 0) {
+                resolve(stdout);
+            } else {
+                // Command executed but returned an error code
+                reject({ type: 'command_error', code, stderr: ignoreStdErr ? "<stderr ignored>" : stderr, filePath });
+            }
+        });
+    });
+}
+
 export async function getMediaInfo(filePath) {
+  // console.log(`Probing: ${filePath}`);
   const ffprobeArgs = [
     '-v', 'quiet',
     '-print_format', 'json',
@@ -13,23 +45,14 @@ export async function getMediaInfo(filePath) {
   ];
 
   try {
-    const result = spawnSync('ffprobe', ffprobeArgs, { encoding: 'utf8' });
-
-    if (result.status !== 0 || result.error) {
-      process.stdout.write('\n');
-      console.error(chalk.red(`ffprobe failed for ${path.basename(filePath)}: Status ${result.status}`));
-      if (result.stderr) console.error('ffprobe stderr:', result.stderr);
-      if (result.error) console.error('ffprobe spawn error:', result.error);
-      return null;
-    }
-
-    const output = JSON.parse(result.stdout);
+    const stdout = await runCommandAsync('ffprobe', ffprobeArgs, filePath, true); // Ignore stderr for ffprobe unless error code
+    const output = JSON.parse(stdout); // Potential JSON parse error
     const stream = output.streams && output.streams[0];
 
     if (!stream) {
-      process.stdout.write('\n');
+      process.stdout.write('\n'); // Newline before warning
       console.warn(chalk.yellow(`No video stream found in ${path.basename(filePath)}`));
-      return null;
+      return null; // Not an error, just no stream
     }
 
     const width = parseInt(stream.width, 10);
@@ -39,18 +62,23 @@ export async function getMediaInfo(filePath) {
     if (isNaN(width) || isNaN(height)) {
       process.stdout.write('\n');
       console.warn(chalk.yellow(`Could not parse width/height for ${path.basename(filePath)}`));
-      return null;
+      return null; // Info missing
     }
 
     return { width, height, bitRate };
 
   } catch (error) {
-    process.stdout.write('\n');
-    console.error(chalk.red(`Error running ffprobe for ${path.basename(filePath)}:`), error.message);
-    if (error.stderr) {
-        console.error('ffprobe stderr:', error.stderr.toString());
+    process.stdout.write('\n'); // Ensure errors/warnings are on new lines
+    if (error.type === 'spawn_error') {
+        console.error(chalk.red(`ffprobe spawn error for ${path.basename(filePath)}:`), error.message);
+    } else if (error.type === 'command_error') {
+        console.error(chalk.red(`ffprobe failed for ${path.basename(filePath)}: Status ${error.code}`));
+        // stderr might be useful here even if ignored on success
+        // console.error('ffprobe stderr:', error.stderr);
+    } else { // Likely JSON parse error or other code error
+        console.error(chalk.red(`Error parsing ffprobe output for ${path.basename(filePath)}:`), error.message);
     }
-    return null;
+    return null; // Indicate failure to get info
   }
 }
 
@@ -59,25 +87,39 @@ function moveFailedFile(filePath, rootDir) {
         const parentDir = path.dirname(rootDir);
         const targetDirName = path.basename(rootDir);
         const relativeFilePath = path.relative(rootDir, filePath);
-        const failedDirPath = path.join(parentDir, `@failed_vc_${targetDirName}`, path.dirname(relativeFilePath));
-        const failedFilePath = path.join(failedDirPath, path.basename(relativeFilePath));
+        // Ensure relative path doesn't start with '..' if file is already outside rootDir somehow
+        const safeRelativePath = relativeFilePath.startsWith('..') ? path.basename(filePath) : relativeFilePath;
+        const failedDirPath = path.join(parentDir, `@failed_vc_${targetDirName}`, path.dirname(safeRelativePath));
+        const failedFilePath = path.join(failedDirPath, path.basename(safeRelativePath));
 
         fs.mkdirSync(failedDirPath, { recursive: true });
-        fs.renameSync(filePath, failedFilePath);
-        process.stdout.write('\n');
-        console.log(chalk.yellow(`Moved failed file to: ${failedFilePath}`));
+        // Check if file still exists before moving (it might have been deleted successfully before a later step failed)
+        if (fs.existsSync(filePath)) {
+            fs.renameSync(filePath, failedFilePath);
+            process.stdout.write('\n');
+            console.log(chalk.yellow(`Moved failed file to: ${failedFilePath}`));
+        } else {
+             process.stdout.write('\n');
+             console.log(chalk.yellow(`Original file ${path.basename(filePath)} was already removed or moved.`));
+        }
     } catch (moveError) {
         process.stdout.write('\n');
         console.error(chalk.red(`Failed to move file ${filePath} after conversion error:`), moveError.message);
     }
 }
 
-export function convertToWebm(filePath, dryRun, crf, rootDir) {
+// Updated to use async spawn
+export async function convertToWebm(filePath, dryRun, crf, rootDir) {
   const parsedPath = path.parse(filePath);
   const outputFilePath = path.join(parsedPath.dir, `${parsedPath.name}.webm`);
 
   if (dryRun) {
     return 'skipped_dry_run';
+  }
+
+  // Check for existing output *before* running ffmpeg
+  if (fs.existsSync(outputFilePath)) {
+      return 'skipped_exists';
   }
 
   const ffmpegArgs = [
@@ -87,50 +129,47 @@ export function convertToWebm(filePath, dryRun, crf, rootDir) {
     '-b:v', '0',
     '-c:a', 'libopus',
     '-cpu-used', '0',
-    '-y',
+    '-y', // Overwrite temp/incomplete files without asking
     outputFilePath,
   ];
 
+
   try {
-    if (fs.existsSync(outputFilePath)) {
-        return 'skipped_exists';
-    }
+      // Run ffmpeg asynchronously
+      await runCommandAsync('ffmpeg', ffmpegArgs, filePath);
 
-    const result = spawnSync('ffmpeg', ffmpegArgs, { stdio: 'pipe' });
-
-    if (result.status === 0) {
+      // If runCommandAsync resolves, ffmpeg succeeded (exit code 0)
       try {
-        fs.unlinkSync(filePath);
-        return 'converted';
+          fs.unlinkSync(filePath); // Delete original file
+          return 'converted';
       } catch (deleteError) {
-        process.stdout.write('\n');
-        console.error(chalk.red(`Successfully converted, but failed to delete original file ${path.basename(filePath)}:`), deleteError.message);
-        return 'error_deleting';
+          process.stdout.write('\n');
+          console.error(chalk.red(`Converted successfully, but failed to delete original ${path.basename(filePath)}:`), deleteError.message);
+          return 'error_deleting'; // Indicate partial failure
       }
-    } else {
-      process.stdout.write('\n');
-      console.error(chalk.red(`FFmpeg conversion failed for ${path.basename(filePath)}:`));
-      console.error(`Status: ${result.status}`);
-      if (result.stderr) {
-        console.error('FFmpeg stderr:', result.stderr.toString());
+
+  } catch (error) {
+      process.stdout.write('\n'); // Newline before error messages
+      if (error.type === 'spawn_error') {
+          console.error(chalk.red(`FFmpeg spawn error for ${path.basename(filePath)}:`), error.message);
+      } else if (error.type === 'command_error') {
+          console.error(chalk.red(`FFmpeg conversion failed for ${path.basename(filePath)} (code: ${error.code}):`));
+          console.error(chalk.gray(error.stderr || 'No stderr captured.')); // Show ffmpeg output on error
+      } else {
+          console.error(chalk.red(`Unexpected error during FFmpeg processing for ${path.basename(filePath)}:`), error);
       }
-       if (result.error) {
-           console.error('Spawn error:', result.error);
-       }
+
+      // Clean up potentially incomplete output file on failure
       if (fs.existsSync(outputFilePath)) {
           try {
               fs.unlinkSync(outputFilePath);
           } catch (cleanupError) {
-              console.error(chalk.yellow(`Error deleting incomplete output file ${path.basename(outputFilePath)}:`), cleanupError.message);
+              console.error(chalk.yellow(`Failed to delete incomplete output ${path.basename(outputFilePath)}:`), cleanupError.message);
           }
       }
+
+      // Move the original failed source file
       moveFailedFile(filePath, rootDir);
-      return 'error_converting';
-    }
-  } catch (spawnError) {
-    process.stdout.write('\n');
-    console.error(chalk.red(`Error spawning FFmpeg for ${path.basename(filePath)}:`), spawnError.message);
-    moveFailedFile(filePath, rootDir);
-    return 'error_spawning';
+      return 'error_converting'; // Indicate failure
   }
 } 
